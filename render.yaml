@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: greek-voicebot
+    env: python
+    region: frankfurt
+    branch: main
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --timeout 120 --workers 1 --threads 8
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 8000
