@@ -6,8 +6,9 @@ services:
     branch: main
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn ORIGINALE:app --timeout 120 --workers 1 --threads 8
+    startCommand: gunicorn ORIGINALE:app -b 0.0.0.0:$PORT --timeout 120 --workers 1 --threads 8
     autoDeploy: true
     envVars:
       - key: PORT
         value: 8000
+
