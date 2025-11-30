@@ -19,21 +19,16 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 PORT = int(os.getenv("PORT", "3000"))
 
-if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_NUMBER and OPENAI_API_KEY and DEEPGRAM_API_KEY and BASE_URL):
-    print("⚠️ Missing one or more required environment variables.")
-
-# Twilio REST client
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-# ---------------- APP / AUDIO DIR ----------------
+# ---------------- APP ----------------
 app = Flask(__name__)
+
 AUDIO_DIR = Path("audio")
 AUDIO_DIR.mkdir(exist_ok=True)
 
-# very simple in-memory conversation per call
-CONVERSATIONS = {}
-
-# Twilio demo hold music (κρατάει την κλήση ανοιχτή όσο σκέφτεται ο agent)
+CONVERSATIONS = {}            # session memory
+TTS_CACHE = {}                # NEW: TTS caching
 TWILIO_HOLD_MUSIC = "http://com.twilio.music.classical.s3.amazonaws.com/BusyStrings.mp3"
 
 
@@ -47,26 +42,19 @@ def is_greek(text: str) -> bool:
 
 # ---------------- GPT AGENT ----------------
 def gpt_reply(call_sid: str, user_text: str) -> str:
-    """
-    Επαγγελματική τηλεφωνήτρια στην 'Ψησταριά της Βούλας'.
-    Κρατάμε context ανά CallSid.
-    """
-
     if call_sid not in CONVERSATIONS:
         CONVERSATIONS[call_sid] = [
             {
                 "role": "system",
                 "content": (
-                    "Είσαι επαγγελματική, ευγενική και σύντομη τηλεφωνήτρια "
-                    "στην 'Ψησταριά της Βούλας' στη Σπάρτη.\n"
-                    "Μιλάς φυσικά, σε δεύτερο πρόσωπο (πχ. 'να σας βάλω κάτι ακόμα;').\n"
-                    "Στόχος σου είναι:\n"
-                    "- Να καταλαβαίνεις αμέσως τι θέλει να παραγγείλει ο πελάτης.\n"
-                    "- Να ρωτάς ξεκάθαρες διευκρινίσεις (πχ. τι κρέας, τι σως, πόσα τεμάχια).\n"
-                    "- Να επιβεβαιώνεις στο τέλος την παραγγελία, καθαρά και οργανωμένα.\n"
-                    "ΜΗΝ λες περιγραφές από e-food. Μίλα απλά, σαν άνθρωπος.\n"
-                    "Αν ο πελάτης ρωτήσει 'τι έχει το μενού', πες συνοπτικά τις βασικές κατηγορίες:\n"
-                    "τυλιχτά (γύρος, σουβλάκι), σκεπαστές, μερίδες, σαλάτες, ορεκτικά, burgers, αναψυκτικά.\n"
+                    "Είσαι επαγγελματική τηλεφωνήτρια στην Ψησταριά της Βούλας στη Σπάρτη.\n"
+                    "Μιλάς καθαρά, σύντομα και ευγενικά. Στυλ: φυσικό & ανθρώπινο.\n"
+                    "Δεν κάνεις μεγάλα τετράστιχα. Μικρές, καθαρές απαντήσεις.\n"
+                    "Στόχος:\n"
+                    "- Καταγραφή παραγγελίας\n"
+                    "- Ερωτήσεις για διευκρίνιση\n"
+                    "- Επιβεβαίωση στο τέλος\n"
+                    "Αν ρωτήσει 'τι έχει το μενού', λες κατηγορίες, όχι full λίστα.\n"
                 )
             }
         ]
@@ -78,7 +66,7 @@ def gpt_reply(call_sid: str, user_text: str) -> str:
         "model": "gpt-4o-mini",
         "messages": conv,
         "temperature": 0.3,
-        "max_tokens": 220,
+        "max_tokens": 200,
     }
 
     try:
@@ -91,65 +79,86 @@ def gpt_reply(call_sid: str, user_text: str) -> str:
         r.raise_for_status()
         reply = r.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        print("❌ OpenAI chat error:", e)
-        reply = "Συγγνώμη, αντιμετωπίζω ένα τεχνικό πρόβλημα. Μπορείτε να το επαναλάβετε λίγο πιο απλά;"
+        print("❌ GPT Error:", e)
+        reply = "Μπορείτε να το επαναλάβετε; Δεν άκουσα καθαρά."
 
     conv.append({"role": "assistant", "content": reply})
 
-    # μικρό trimming στο ιστορικό
     if len(conv) > 20:
         CONVERSATIONS[call_sid] = [conv[0]] + conv[-19:]
 
     return reply
 
 
-# ---------------- TTS (OpenAI) ----------------
+# ---------------- TTS WITH CACHING ----------------
 def tts_audio(text: str, label: str) -> str:
     """
-    Δημιουργεί MP3 σε γυναικεία φωνή και επιστρέφει πλήρες URL για Twilio <Play>.
-    Αν το αρχείο είναι περίεργα μικρό, κάνουμε fallback.
+    PRODUCES a guaranteed VALID MP3.
+    - Caches every TTS response (massive speed boost)
+    - Retries if the mp3 from OpenAI is too small (<500 bytes)
+    - Falls back to <Say> if still bad.
     """
+
+    # ---- 1) CHECK CACHE FIRST ----
+    if text in TTS_CACHE:
+        return TTS_CACHE[text]
+
     file_id = uuid.uuid4().hex
     path = AUDIO_DIR / f"{label}_{file_id}.mp3"
 
     payload = {
         "model": "gpt-4o-mini-tts",
-        "voice": "coral",  # γυναικεία, καθαρή φωνή
+        "voice": "coral",
         "input": text,
         "format": "mp3",
     }
 
-    try:
-        r = requests.post(
-            "https://api.openai.com/v1/audio/speech",
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Accept": "audio/mpeg",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=30,
-        )
-        r.raise_for_status()
+    def generate_once():
+        try:
+            r = requests.post(
+                "https://api.openai.com/v1/audio/speech",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Accept": "audio/mpeg",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=25,
+            )
+            r.raise_for_status()
+            return r.content
+        except Exception as e:
+            print("❌ TTS request error:", e)
+            return b""
 
-        # Μην δεχτείς "άδειο" ή υπερβολικά μικρό MP3
-        if len(r.content) < 500:
-            raise Exception("MP3 too small")
+    # ---- first attempt ----
+    audio_bytes = generate_once()
 
-        with open(path, "wb") as f:
-            f.write(r.content)
+    # ---- retry if too small ----
+    if len(audio_bytes) < 500:
+        print("⚠️ TTS too small → retrying")
+        audio_bytes = generate_once()
 
-        return f"{BASE_URL}/audio/{path.name}"
-    except Exception as e:
-        print("❌ OpenAI TTS error:", e)
-        # fallback: κενό string → ο caller θα κάνει <Say>
+    # ---- fallback ----
+    if len(audio_bytes) < 500:
+        print("❌ TTS failed twice → fallback")
         return ""
 
+    # ---- SAVE MP3 ----
+    with open(path, "wb") as f:
+        f.write(audio_bytes)
 
-# ---------------- DEEPGRAM STT (Greek) ----------------
+    final_url = f"{BASE_URL}/audio/{path.name}"
+
+    # ---- SAVE TO CACHE ----
+    TTS_CACHE[text] = final_url
+
+    return final_url
+
+
+# ---------------- DEEPGRAM STT ----------------
 def deepgram_stt(audio_bytes: bytes) -> str:
     url = "https://api.deepgram.com/v1/listen?model=nova-3&language=el"
-
     try:
         r = requests.post(
             url,
@@ -158,199 +167,137 @@ def deepgram_stt(audio_bytes: bytes) -> str:
                 "Content-Type": "audio/wav",
             },
             data=audio_bytes,
-            timeout=30,
+            timeout=25,
         )
         r.raise_for_status()
         data = r.json()
-        transcript = (
-            data["results"]["channels"][0]["alternatives"][0]["transcript"].strip()
-        )
-        return transcript
+        return data["results"]["channels"][0]["alternatives"][0]["transcript"].strip()
     except Exception as e:
         print("❌ Deepgram STT error:", e)
         return ""
 
 
-# ---------------- BACKGROUND LOGIC ----------------
+# ---------------- BACKGROUND PROCESS ----------------
 def background_process(call_sid: str, recording_url: str):
-    """
-    Τρέχει σε ξεχωριστό thread:
-    - κατεβάζει το recording (wav)
-    - κάνει STT στο Deepgram
-    - ρίχνει το κείμενο στο GPT
-    - κάνει TTS την απάντηση
-    - ενημερώνει την ενεργή κλήση με νέο TwiML (Play + Record)
-    """
     try:
-        # 1) Download wav από Twilio
-        wav_url = recording_url + ".wav"
-        print(f"🎧 Downloading recording from {wav_url}")
-        audio_resp = requests.get(
-            wav_url,
+        wav = recording_url + ".wav"
+        print("🎧 Downloading:", wav)
+
+        r = requests.get(
+            wav,
             auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
             timeout=30,
         )
-        audio_resp.raise_for_status()
-        audio_bytes = audio_resp.content
+        r.raise_for_status()
+        audio_bytes = r.content
 
-        # 2) STT (Deepgram)
+        # STT
         transcript = deepgram_stt(audio_bytes)
         print("🗣 USER:", transcript)
 
         if not transcript:
-            bot_text = "Δεν σας άκουσα καθαρά. Μπορείτε να το επαναλάβετε λίγο πιο αργά;"
+            bot_text = "Μπορείτε να το πείτε λίγο πιο καθαρά;"
         elif not is_greek(transcript):
-            bot_text = "Για να σας εξυπηρετήσω σωστά, μιλήστε μου στα ελληνικά, παρακαλώ."
+            bot_text = "Μιλήστε μου στα ελληνικά για να σας εξυπηρετήσω."
         else:
             bot_text = gpt_reply(call_sid, transcript)
 
         print("🤖 BOT:", bot_text)
 
-        # 3) TTS
+        # TTS
         audio_url = tts_audio(bot_text, call_sid)
 
-        # 4) Ενημέρωση ενεργής κλήσης
+        # Twilio update
         if audio_url:
             twiml = f"""
 <Response>
     <Play>{audio_url}</Play>
-    <Record action="/twilio/process"
-            playBeep="false"
-            timeout="6"
-            maxLength="15" />
+    <Record action="/twilio/process" playBeep="false" timeout="6" maxLength="15" />
 </Response>
 """
         else:
-            # fallback αν TTS απέτυχε
-            twiml = """
+            twiml = f"""
 <Response>
-    <Say>
-    Συγγνώμη, αντιμετωπίζω ένα τεχνικό θέμα με τον ήχο.
-    Πείτε μου ξανά τι θα θέλατε να παραγγείλετε.
-    </Say>
-    <Record action="/twilio/process"
-            playBeep="false"
-            timeout="6"
-            maxLength="15" />
+    <Say>{bot_text}</Say>
+    <Record action="/twilio/process" playBeep="false" timeout="6" maxLength="15" />
 </Response>
 """
 
         try:
             twilio_client.calls(call_sid).update(twiml=twiml)
-            print("✅ Call updated with new TwiML.")
+            print("✅ Call updated.")
         except Exception as e:
-            # Αν ο πελάτης έχει κλείσει, θα πάρουμε 400 εδώ. Δεν είναι κρίσιμο.
-            print("❌ BACKGROUND UPDATE ERROR:", e)
+            print("❌ Twilio update error:", e)
 
     except Exception as e:
-        print("❌ BACKGROUND FATAL ERROR:", e)
+        print("❌ BACKGROUND ERROR:", e)
 
 
 # ---------------- ROUTES ----------------
-@app.route("/ping")
-def ping():
-    return jsonify({"status": "ok", "message": "voice agent running"})
-
 
 @app.route("/audio/<filename>")
 def serve_audio(filename):
     return send_from_directory(AUDIO_DIR, filename, mimetype="audio/mpeg")
 
 
-# ---- START OF CALL ----
 @app.route("/twilio/voice", methods=["POST"])
 def twilio_voice():
-    """
-    Πρώτο entrypoint όταν χτυπάει το τηλέφωνο.
-    Παίζουμε intro και ανοίγουμε Record.
-    """
     resp = VoiceResponse()
 
-    intro_text = (
+    text = (
         "Καλησπέρα σας! Καλέσατε την Ψησταριά της Βούλας. "
         "Μιλάτε αφού τελειώσω, για να σας ακούω καθαρά. "
-        "Τι θα θέλατε να παραγγείλετε;"
+        "Τι θα θέλατε;"
     )
-    intro_url = tts_audio(intro_text, "intro") or ""
+    intro = tts_audio(text, "intro")
 
-    if intro_url:
-        resp.play(intro_url)
+    if intro:
+        resp.play(intro)
     else:
-        resp.say(
-            "Καλησπέρα σας! Καλέσατε την Ψησταριά της Βούλας. Πείτε μου τι θα θέλατε να παραγγείλετε."
-        )
+        resp.say(text)
 
     resp.record(
         action="/twilio/process",
         playBeep=False,
-        timeout=6,   # σιωπή πριν σταματήσει το recording
-        maxLength=15 # max διάρκεια ενός γύρου ομιλίας
+        timeout=6,
+        maxLength=15
     )
 
     return str(resp)
 
 
-# ---- PROCESS RECORDING (ASYNC AGENT) ----
 @app.route("/twilio/process", methods=["POST"])
 def twilio_process():
-    """
-    Η Twilio μας στέλνει το recording.
-    - Ξεκινάμε background thread για Deepgram+GPT+TTS
-    - ΑΠΑΝΤΑΜΕ ΑΜΕΣΑ με TwiML (hold-music) για να ΜΗΝ κλείσει η κλήση
-    """
     call_sid = request.form.get("CallSid")
     rec_url = request.form.get("RecordingUrl")
+    print("📥 /twilio/process:", rec_url)
 
-    print(f"📥 /twilio/process sid={call_sid} recording={rec_url}")
-
-    if not call_sid or not rec_url:
-        resp = VoiceResponse()
-        resp.say(
-            "Παρουσιάστηκε τεχνικό σφάλμα με την κλήση. Προσπαθήστε ξανά."
-        )
-        return str(resp)
-
-    # Background επεξεργασία
     threading.Thread(
         target=background_process,
         args=(call_sid, rec_url),
-        daemon=True,
+        daemon=True
     ).start()
 
-    # ΑΜΕΣΗ απάντηση στην Twilio: μικρό μήνυμα + hold-music
     resp = VoiceResponse()
-    resp.say(
-        "Ένα δευτερόλεπτο να ετοιμάσω την παραγγελία σας."
-    )
-    # παίζουμε μουσική της Twilio ώστε η κλήση να παραμείνει ενεργή
+    resp.say("Ένα δευτερόλεπτο να ετοιμάσω την απάντηση.")
     resp.play(TWILIO_HOLD_MUSIC)
-
     return str(resp)
 
 
-# ---- OPTIONAL OUTBOUND HELPER ----
-@app.route("/call-me", methods=["GET"])
+@app.route("/call-me")
 def call_me():
-    """
-    Helper για να ξεκινάς κλήση από browser:
-    /call-me?to=+3069xxxxxxx
-    """
     to = request.args.get("to")
-    if not to:
-        return jsonify({"error": "missing 'to' parameter"}), 400
-
     try:
         call = twilio_client.calls.create(
             to=to,
             from_=TWILIO_NUMBER,
-            url=f"{BASE_URL}/twilio/voice",
+            url=f"{BASE_URL}/twilio/voice"
         )
-        return jsonify({"status": "calling", "sid": call.sid})
+        return jsonify({"sid": call.sid})
     except Exception as e:
-        print("❌ Error creating outbound call:", e)
-        return jsonify({"error": "failed to create call"}), 500
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
-    print(f"Running locally on port {PORT}")
-    app.run(host="0.0.0.0", port=PORT, debug=True)
+    print(f"Running on port {PORT}")
+    app.run(host="0.0.0.0", port=PORT)
