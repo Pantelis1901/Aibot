@@ -92,7 +92,7 @@ def gpt_reply(call_sid: str, user_text: str) -> str:
         reply = r.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
         print("❌ OpenAI chat error:", e)
-        reply = "Συγγνώμη, αντιμετωπίζω ένα τεχνικό πρόβλημα. Μπορείτε να επαναλάβετε λίγο πιο απλά;"
+        reply = "Συγγνώμη, αντιμετωπίζω ένα τεχνικό πρόβλημα. Μπορείτε να το επαναλάβετε λίγο πιο απλά;"
 
     conv.append({"role": "assistant", "content": reply})
 
@@ -107,6 +107,7 @@ def gpt_reply(call_sid: str, user_text: str) -> str:
 def tts_audio(text: str, label: str) -> str:
     """
     Δημιουργεί MP3 σε γυναικεία φωνή και επιστρέφει πλήρες URL για Twilio <Play>.
+    Αν το αρχείο είναι περίεργα μικρό, κάνουμε fallback.
     """
     file_id = uuid.uuid4().hex
     path = AUDIO_DIR / f"{label}_{file_id}.mp3"
@@ -130,12 +131,18 @@ def tts_audio(text: str, label: str) -> str:
             timeout=30,
         )
         r.raise_for_status()
+
+        # Μην δεχτείς "άδειο" ή υπερβολικά μικρό MP3
+        if len(r.content) < 500:
+            raise Exception("MP3 too small")
+
         with open(path, "wb") as f:
             f.write(r.content)
+
         return f"{BASE_URL}/audio/{path.name}"
     except Exception as e:
         print("❌ OpenAI TTS error:", e)
-        # fallback: Twilio <Say>
+        # fallback: κενό string → ο caller θα κάνει <Say>
         return ""
 
 
@@ -217,7 +224,7 @@ def background_process(call_sid: str, recording_url: str):
             # fallback αν TTS απέτυχε
             twiml = """
 <Response>
-    <Say language="el-GR" voice="alice">
+    <Say>
     Συγγνώμη, αντιμετωπίζω ένα τεχνικό θέμα με τον ήχο.
     Πείτε μου ξανά τι θα θέλατε να παραγγείλετε.
     </Say>
@@ -270,10 +277,7 @@ def twilio_voice():
         resp.play(intro_url)
     else:
         resp.say(
-            "Καλησπέρα σας! Καλέσατε την Ψησταριά της Βούλας. "
-            "Πείτε μου τι θα θέλατε να παραγγείλετε.",
-            language="el-GR",
-            voice="alice",
+            "Καλησπέρα σας! Καλέσατε την Ψησταριά της Βούλας. Πείτε μου τι θα θέλατε να παραγγείλετε."
         )
 
     resp.record(
@@ -302,9 +306,7 @@ def twilio_process():
     if not call_sid or not rec_url:
         resp = VoiceResponse()
         resp.say(
-            "Παρουσιάστηκε τεχνικό σφάλμα με την κλήση. Προσπαθήστε ξανά.",
-            language="el-GR",
-            voice="alice",
+            "Παρουσιάστηκε τεχνικό σφάλμα με την κλήση. Προσπαθήστε ξανά."
         )
         return str(resp)
 
@@ -318,9 +320,7 @@ def twilio_process():
     # ΑΜΕΣΗ απάντηση στην Twilio: μικρό μήνυμα + hold-music
     resp = VoiceResponse()
     resp.say(
-        "Ένα δευτερόλεπτο να ετοιμάσω την παραγγελία σας.",
-        language="el-GR",
-        voice="alice",
+        "Ένα δευτερόλεπτο να ετοιμάσω την παραγγελία σας."
     )
     # παίζουμε μουσική της Twilio ώστε η κλήση να παραμείνει ενεργή
     resp.play(TWILIO_HOLD_MUSIC)
